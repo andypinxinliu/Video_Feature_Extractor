@@ -1,0 +1,5 @@
+data/charades_v1_rgb
+data/thumos14
+data/activitynet
+model/*
+
