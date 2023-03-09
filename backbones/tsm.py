@@ -12,12 +12,10 @@ import torchvision
 
 
 dirname = os.path.dirname(__file__)
-sys.path.insert(0, os.path.join(dirname, '..'))
-from opts import cfg
 
 
 # this variable is helpful for recover the video sequence from batched images
-BATCH_SIZE = None   
+BATCH_SIZE = None
 VERBOSE = False
 
 
@@ -28,8 +26,10 @@ class TemporalShift(nn.Module):
         self.fold_div = n_div
         self.inplace = inplace
         if inplace:
-            if VERBOSE:  print('=> Using in-place shift...')
-        if VERBOSE:  print('=> Using fold div: {}'.format(self.fold_div))
+            if VERBOSE:
+                print('=> Using in-place shift...')
+        if VERBOSE:
+            print('=> Using fold div: {}'.format(self.fold_div))
 
     def forward(self, x):
         x = self.shift(x, fold_div=self.fold_div, inplace=self.inplace)
@@ -45,14 +45,15 @@ class TemporalShift(nn.Module):
 
         fold = c // fold_div
         if inplace:
-            # Due to some out of order error when performing parallel computing. 
+            # Due to some out of order error when performing parallel computing.
             # May need to write a CUDA kernel.
-            raise NotImplementedError  
+            raise NotImplementedError
             # out = InplaceShift.apply(x, fold)
         else:
             out = torch.zeros_like(x)
             out[:, :-1, :fold] = x[:, 1:, :fold]  # shift left
-            out[:, 1:, fold: 2 * fold] = x[:, :-1, fold: 2 * fold]  # shift right
+            out[:, 1:, fold: 2 * fold] = x[:, :-
+                                           1, fold: 2 * fold]  # shift right
             out[:, :, 2 * fold:] = x[:, :, 2 * fold:]  # not shift
 
         return out.view(nt, c, h, w)
@@ -102,21 +103,23 @@ class TemporalPool(nn.Module):
         nt, c, h, w = x.size()
         n_batch = BATCH_SIZE
         n_segment = nt // n_batch
-        x = x.view(n_batch, n_segment, c, h, w).transpose(1, 2)  # n, c, t, h, w
-        x = F.max_pool3d(x, kernel_size=(3, 1, 1), stride=(2, 1, 1), padding=(1, 0, 0))
+        x = x.view(n_batch, n_segment, c, h, w).transpose(
+            1, 2)  # n, c, t, h, w
+        x = F.max_pool3d(x, kernel_size=(3, 1, 1),
+                         stride=(2, 1, 1), padding=(1, 0, 0))
         x = x.transpose(1, 2).contiguous().view(nt // 2, c, h, w)
         return x
 
-    
 
 def make_temporal_shift(net, n_div=8, place='blockres'):
- 
+
     # import torchvision
     # if isinstance(net, torchvision.models.ResNet):
     if place == 'block':
         def make_block_temporal(stage):
             blocks = list(stage.children())
-            if VERBOSE:  print('=> Processing stage with {} blocks'.format(len(blocks)))
+            if VERBOSE:
+                print('=> Processing stage with {} blocks'.format(len(blocks)))
             for i, b in enumerate(blocks):
                 blocks[i] = TemporalShift(b, n_div=n_div)
             return nn.Sequential(*(blocks))
@@ -131,11 +134,13 @@ def make_temporal_shift(net, n_div=8, place='blockres'):
         n_round = 1
         if len(list(net.layer3.children())) >= 23:
             n_round = 2
-            if VERBOSE:  print('=> Using n_round {} to insert temporal shift'.format(n_round))
+            if VERBOSE:
+                print('=> Using n_round {} to insert temporal shift'.format(n_round))
 
         def make_block_temporal(stage):
             blocks = list(stage.children())
-            if VERBOSE:  print('=> Processing stage with {} blocks residual'.format(len(blocks)))
+            if VERBOSE:
+                print('=> Processing stage with {} blocks residual'.format(len(blocks)))
             for i, b in enumerate(blocks):
                 if i % n_round == 0:
                     blocks[i].conv1 = TemporalShift(b.conv1, n_div=n_div)
@@ -145,12 +150,13 @@ def make_temporal_shift(net, n_div=8, place='blockres'):
         net.layer2 = make_block_temporal(net.layer2)
         net.layer3 = make_block_temporal(net.layer3)
         net.layer4 = make_block_temporal(net.layer4)
-   
+
 
 def make_temporal_pool(net, n_segment):
     import torchvision
     if isinstance(net, torchvision.models.ResNet):
-        if VERBOSE:  print('=> Injecting nonlocal pooling')
+        if VERBOSE:
+            print('=> Injecting nonlocal pooling')
         net.layer2 = TemporalPool(net.layer2, n_segment)
     else:
         raise NotImplementedError
@@ -171,8 +177,8 @@ class TSM(nn.Module):
         self.shift_place = shift_place
         self.temporal_pool = temporal_pool
         self._freeze_bn = freeze_bn
-        self._freeze_bn_affine = cfg.freeze_affine
-        self.frozen_stages = cfg.frozen_stages
+        self._freeze_bn_affine = True
+        self.frozen_stages = -1
 
         self.out_channels = 2048 if int(arch[len('resnet'):]) >= 50 else 512
 
@@ -189,16 +195,15 @@ class TSM(nn.Module):
                 self.add_module(name, module)
 
             if is_shift:
-                make_temporal_shift(self, 
+                make_temporal_shift(self,
                                     n_div=self.shift_div, place=self.shift_place)
         else:
             raise ValueError("Unsupported arch {}".format(arch))
-        
 
     def extract_features(self, x):
         '''Extract 5D feature maps'''
         N, C, T, H, W = x.shape
-         
+
         global BATCH_SIZE
         BATCH_SIZE = N
         x = x.transpose(1, 2).flatten(0, 1).contiguous()  # (n*t, c, h, w)
@@ -213,7 +218,8 @@ class TSM(nn.Module):
         x = self.layer3(x)
         x = self.layer4(x)     # (n*t,c,h,w)
         NT, C, H, W = x.shape
-        x = x.reshape([N, NT//N, C, H, W]).transpose(1, 2).contiguous()  # (n,c,t, h, w)
+        x = x.reshape([N, NT//N, C, H, W]).transpose(1,
+                                                     2).contiguous()  # (n,c,t, h, w)
         return x
 
     def forward(self, x):
@@ -223,7 +229,7 @@ class TSM(nn.Module):
     def load_pretrained_weight(self, ckpt_path=None):
         if ckpt_path is None:
             ckpt_path = 'https://hanlab.mit.edu/projects/tsm/models/TSM_kinetics_RGB_resnet50_shift8_blockres_avg_segment8_e100_dense.pth'
-        
+
         logging.info('loading pretrained model {}'.format(ckpt_path))
 
         if ckpt_path.startswith('http'):
@@ -233,16 +239,18 @@ class TSM(nn.Module):
             checkpoint = torch.load(ckpt_path)
         checkpoint = checkpoint['state_dict']
 
-        base_dict = {'.'.join(k.split('.')[2:]): v for k, v in list(checkpoint.items())}
-        
+        base_dict = {'.'.join(k.split('.')[2:]): v for k, v in list(
+            checkpoint.items())}
+
         self.load_state_dict(base_dict, strict=False)
 
     def train(self, mode=True):
         super().train(mode)
         if self.frozen_stages >= 0:
-            logging.info('freeze 0 to {} stage (0-index)'.format(self.frozen_stages))
+            logging.info(
+                'freeze 0 to {} stage (0-index)'.format(self.frozen_stages))
         self._freeze_stages()
-        
+
         if self._freeze_bn and mode:
             for name, m in self.named_modules():
                 if isinstance(m, nn.BatchNorm2d):
@@ -250,7 +258,6 @@ class TSM(nn.Module):
                     if self._freeze_bn_affine:
                         m.weight.requires_grad_(False)
                         m.bias.requires_grad_(False)
-                
 
     def _freeze_stages(self):
         """Prevent all the parameters from being optimized before
@@ -320,11 +327,10 @@ def test_shift():
     print('Test passed.')
 
 
-
 def measure_time(model, x, repeat=20, warmup=10):
     for _ in range(warmup):
         y = model(x)
-    
+
     s = time.time()
     for _ in range(repeat):
         y = model(x)
@@ -342,9 +348,9 @@ if __name__ == '__main__':
     import os
     os.environ['CUDA_VISIBLE_DEVICES'] = '2'
     is_shift = True
-    
+
     model = TSM(arch='resnet18', is_shift=is_shift).cuda()
-    
+
     model.eval()
     model.requires_grad_(False)
 
@@ -358,6 +364,6 @@ if __name__ == '__main__':
 
     time_cost = measure_time(model, x, repeat=20, warmup=10)
     memory = torch.cuda.max_memory_allocated() / 1024 / 1024
-    
-    print('Time {:.2f}ms {:.0f}M memory {:.1f}GFLOPS'.format(time_cost*1000, memory, flops))
-    
+
+    print('Time {:.2f}ms {:.0f}M memory {:.1f}GFLOPS'.format(
+        time_cost*1000, memory, flops))

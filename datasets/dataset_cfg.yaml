@@ -1,75 +1,103 @@
 multithumos:
-  lr: 2e-4
-  lr_backbone: 1e-5
-  batch_size: 3
-  weight_decay: 1e-4
-  lr_drop: 10
-  clip_max_norm: 0.1
-
   # Dataset parameters
-  window_size: 64
+  window_size: 64 # 64 * 4 = 256 frames per input
   num_classes: 65
   interval: 4
-  frame_folder: data/multithumos_frames
+  frame_folder: data/thumos14
   tensor_folder: data/multithumos_tensors
   annotation_path: datasets/multithumos.json
   frame_file_path: datasets/multithumos_frames.json
+  crop_size: 224
+  resize: 256
 
-  # Model parameters
-  dec_layers: 4
-  dim_feedforward: 2048
-  hidden_dim: 512
-  dropout: 0.1
-  nheads: 8
-  num_queries: 48
-  num_querypoints: 21
-  model_path: ckpt/rgb_imagenet.pt
-
-  # Loss parameters
-  aux_loss: true
-  set_cost_class: 10
-  set_cost_seg: 5
-  set_cost_giou: 5
-  dice_loss_coef: 10
-  seg_loss_coef: 5
-  giou_loss_coef: 5
-  dense_loss_coef: 10
-  eos_coef: 0.1
+# Model parameters
+  spatial_pool: avg
+  temporal_upscale: false
+  temporal_upsample: false
+  resize_keep_asr: true
+  # snippet wise feature extraction (not recommended)
+  snippet_wise_feature: false
+  snippet_length: 8
+  snippet_stride: 4
+  
+  i3d_path: model/rgb_imagenet.pt
+  slowfast_path: https://download.openmmlab.com/mmaction/recognition/slowfast/slowfast_r50_256p_4x16x1_256e_kinetics400_rgb/slowfast_r50_256p_4x16x1_256e_kinetics400_rgb_20200728-145f1097.pth
+  slowfast_depth: 50
 
 charades:
-  lr: 1e-4
-  lr_backbone: 1e-5
-  batch_size: 2
-  weight_decay: 1e-4
-  lr_drop: 30
-  clip_max_norm: 0.1
-
   # Dataset parameters
-  window_size: 100
+  window_size: 100 # 100 * 4 = 400 frames per input
   num_classes: 157
   interval: 4
   frame_folder: data/charades_v1_rgb
   tensor_folder: data/charades_v1_rgb_tensors
   annotation_path: datasets/charades.json
   frame_file_path: datasets/charades_frames.json
+  crop_size: 224
+  resize: 256
 
   # Model parameters
-  dec_layers: 4
-  dim_feedforward: 2048
-  hidden_dim: 512
-  dropout: 0.1
-  nheads: 8
-  num_queries: 48
-  num_querypoints: 15
-  model_path: ckpt/rgb_charades.pt
+  spatial_pool: avg
+  temporal_upscale: false
+  temporal_upsample: false
+  resize_keep_asr: true
+  # snippet wise feature extraction (not recommended)
+  snippet_wise_feature: false
+  snippet_length: 8
+  snippet_stride: 4
 
-  # Loss parameters
-  aux_loss: true
-  set_cost_class: 10
-  set_cost_seg: 5
-  set_cost_giou: 5
-  dice_loss_coef: 10
-  seg_loss_coef: 5
-  giou_loss_coef: 5
-  dense_loss_coef: 5
-  eos_coef: 0.1
+  i3d_path: ckpt/rgb_charades.pt
+  slowfast_path: https://download.openmmlab.com/mmaction/recognition/slowfast/slowfast_r50_256p_4x16x1_256e_kinetics400_rgb/slowfast_r50_256p_4x16x1_256e_kinetics400_rgb_20200728-145f1097.pth
+  slowfast_depth: 50
+
+thumos14:
+  # Dataset parameters
+  window_size: 64 # 64 * 4 = 256 frames per input
+  num_classes: 20
+  interval: 4
+  frame_folder: data/thumos14
+  tensor_folder: data/multithumos_tensors
+  annotation_path: datasets/thumos14.json
+  frame_file_path: datasets/multithumos_frames.json
+  crop_size: 224
+  resize: 256
+
+  # Model parameters
+  spatial_pool: avg
+  temporal_upscale: false
+  temporal_upsample: false
+  resize_keep_asr: true
+  # snippet wise feature extraction (not recommended)
+  snippet_wise_feature: false
+  snippet_length: 8
+  snippet_stride: 4
+
+  i3d_path: model/rgb_imagenet.pt
+  slowfast_path: https://download.openmmlab.com/mmaction/recognition/slowfast/slowfast_r50_256p_4x16x1_256e_kinetics400_rgb/slowfast_r50_256p_4x16x1_256e_kinetics400_rgb_20200728-145f1097.pth
+  slowfast_depth: 50
+
+activitynet:
+  # Dataset parameters
+  window_size: 64 # 64 * 4 = 256 frames per input
+  num_classes: 200
+  interval: 4
+  frame_folder: data/multithumos_frames
+  tensor_folder: data/multithumos_tensors
+  annotation_path: datasets/multithumos.json
+  frame_file_path: datasets/multithumos_frames.json
+  crop_size: 224
+  resize: 256
+
+  # Model parameters
+  spatial_pool: avg
+  temporal_upscale: false
+  temporal_upsample: false
+  resize_keep_asr: true
+  # snippet wise feature extraction (not recommended)
+  snippet_wise_feature: false
+  snippet_length: 8
+  snippet_stride: 4
+
+  i3d_path: model/rgb_imagenet.pt
+  slowfast_path: https://download.openmmlab.com/mmaction/recognition/slowfast/slowfast_r50_256p_4x16x1_256e_kinetics400_rgb/slowfast_r50_256p_4x16x1_256e_kinetics400_rgb_20200728-145f1097.pth
+  slowfast_depth: 50

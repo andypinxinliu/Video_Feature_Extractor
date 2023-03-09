@@ -2,4 +2,8 @@ data/charades_v1_rgb
 data/thumos14
 data/activitynet
 model/*
-
+backbones/__pycache__
+datasets/__pycache__
+__pycache__
+data/thumos14_tensors
+data/charades_v1_rgb_tensors

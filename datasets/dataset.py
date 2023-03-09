@@ -1,287 +1,587 @@
-# ------------------------------------------------------------------------
-# Modified from TadTR: End-to-end Temporal Action Detection with Transformer
-# Copyright (c) 2021 - 2022. Xiaolong Liu.
-# ------------------------------------------------------------------------
+'''
+Modified from PointTAD (https://github.com/MCG-NJU/PointTAD/blob/main/datasets/dataset.py)
+'''
 
-'''Universal TAD Dataset loader.'''
-
+import argparse
+import copy
 import json
-import logging
-import math
-import os.path as osp
-import ipdb as pdb
+import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 import torch.utils.data
-import tqdm
-import h5py
-
-from .data_utils import get_dataset_dict, load_feature, get_dataset_info
-from .e2e_lib import make_img_transform, load_video_frames
-# from util.config import cfg
-
-from util.segment_ops import segment_t1t2_to_cw
+import h5py as h5
+from tqdm import tqdm
+import cv2
+from torchvision import transforms
+from .transforms import GroupResizeShorterSide, GroupCenterCrop, GroupRandomCrop, GroupRandomHorizontalFlip, GroupPhotoMetricDistortion, GroupRotate
 
 
 
-class TADDataset(torch.utils.data.Dataset):
-    def __init__(self, subset, mode, feature_info, ann_file, ft_info_file, transforms, mem_cache=False, online_slice=False, slice_len=None, slice_overlap=0, binary=False, padding=True, input_type='feature', img_stride=1):
-        '''TADDataset
-        Parameters:
-            subset: train/val/test
-            mode: train, or test
-            feature_info: basic info of video features, e.g. path, file format, filename template
-            ann_file: path to the ground truth file
-            ft_info_file: path to the file that describe other information of each video
-            transforms: which transform to use
-            mem_cache: cache features of the whole dataset into memory.
-            binary: transform all gt to binary classes. This is required for training a class-agnostic detector
-            padding: whether to pad the input feature to `slice_len`
-        
-        '''
+# the following defines the transforms for training and testing
+def transform(crop_size, resize):
+    training_transforms = transforms.Compose([
+        GroupResizeShorterSide(resize),
+        GroupRandomCrop(crop_size),
+        GroupPhotoMetricDistortion(brightness_delta=32,
+                                contrast_range=(0.5, 1.5),
+                                saturation_range=(0.5, 1.5),
+                                hue_delta=18,
+                                p=0.5),
+        GroupRotate(limit=(-45, 45), border_mode='reflect101', p=0.5),
+        GroupRandomHorizontalFlip(0.5),
+    ])
 
-        super().__init__()
-        self.feature_info = feature_info
-        self.ann_file = ann_file
-        self.ft_info_file = ft_info_file
-        self.subset = subset
-        self.online_slice = online_slice
-        self.slice_len = slice_len
-        self.slice_overlap = slice_overlap
-        self.padding = padding
-        self.mode = mode
-        self.transforms = transforms
-        print('Use data transform {}'.format(self.transforms))
-        self.binary = binary
-        self.is_image_input = input_type == 'image'
-        self.mem_cache = mem_cache
-        self.img_stride = img_stride
+    testing_transforms = transforms.Compose([
+        GroupResizeShorterSide(IMAGE_RESIZE_SIZE),
+        GroupCenterCrop(IMAGE_CROP_SIZE),
+    ])
+    return training_transforms, testing_transforms
 
-        self._prepare()
 
-    def _get_classes(self, anno_dict):
-        '''get class list from the annotation dict'''
-        if 'classes' in anno_dict:
-            classes = anno_dict['classes']
+def load_json(file):
+    with open(file) as json_file:
+        data = json.load(json_file)
+        return data
+
+
+class VideoRecord:
+    def __init__(self, vid, num_frames, locations, gt, fps, window_size, interval):
+        self.id = vid
+        self.locations = locations
+        self.base = float(locations[0])
+        self.window_size = window_size
+        self.interval = interval
+        self.locations_norm = [
+            (i - self.base) / (self.window_size * self.interval)
+            for i in locations
+        ]
+        self.locations_offset = [
+            location - self.base for location in locations
+        ]
+        self.num_frames = num_frames
+
+        self.gt = gt
+        self.gt_norm = copy.deepcopy(gt)
+
+        for i in self.gt_norm:
+            i[0][0] = (i[0][0] - self.base) / (self.window_size *
+                                               self.interval)
+            i[0][1] = (i[0][1] - self.base) / (self.window_size *
+                                               self.interval)
+
+        self.gt_s_e_frames = [i[0] for i in self.gt_norm]
+        self.fps = fps
+
+
+class MultiTHUMOS(torch.utils.data.Dataset):
+    def __init__(self, anno_file, frame_file, frame_folder, split, window_size, interval, num_classes, img_tensor=None, tensor_folder=None, crop_size=224, resize=256):
+        self.window_size = window_size
+        self.interval = interval
+        self.crop_size = crop_size
+        self.resize = resize
+        self.anno_file = load_json(anno_file)
+        self.frame_file = load_json(frame_file)
+        self.tensor_folder = tensor_folder
+        self.img_tensor = img_tensor
+
+        video_list = self.anno_file.keys()
+        self.num_classes = num_classes
+        self.split = split
+        video_seq = list(video_list)
+        video_seq.sort()
+        self.video_dict = {video_seq[i]: i for i in range(len(video_seq))}
+        self.frame_folder = frame_folder
+        overlap_dict = {'training': 4, 'testing': 1}
+
+        self.video_list = []
+        self.video_frame_pool = {}
+        for vid in video_list:
+            if self.anno_file[vid]['subset'] == self.split:
+                num_frames = int(self.frame_file[vid])
+                fps = num_frames / self.anno_file[vid]['duration']
+
+                # get annotations
+                annotations = [
+                    [int(fps*item[1]), int(fps*item[2])]
+                    for item in self.anno_file[vid]['actions']
+                ]
+
+                # get labels
+                labels = [
+                    int(item[0])-1
+                    for item in self.anno_file[vid]['actions']
+                ]
+
+                # every 4 frames extract one feature
+                frames = np.array(
+                    range(1, num_frames-self.interval, self.interval)).reshape(-1, 1)
+
+                seq_len = len(frames)
+
+                # if the seq_len is less than window_size, we pad the location with the last frame
+                if seq_len <= self.window_size:
+                    locations = np.zeros((self.window_size, 1))
+                    locations[:seq_len, :] = frames
+                    locations[seq_len:, :] = frames[-1]
+                    gt = [(annotations[idx], labels[idx])
+                          for idx in range(len(annotations))]
+                    if self.split == 'training' and len(gt) == 0:
+                        print(vid)
+                    self.video_list.append(
+                        VideoRecord(vid, num_frames, locations, gt, fps, self.window_size, self.interval))
+
+                # If the number of frames in the video is greater than or equal to the window size, 
+                # we divides the frames into overlapping windows, where the overlap is defined 
+                # as overlap_ratio
+                else:
+                    overlap_ratio = overlap_dict[self.split]
+
+                    # get the stride of each window
+                    stride = self.window_size // overlap_ratio
+
+                    # get the start location of each window
+                    ws_starts = [
+                        i * stride
+                        for i in range((seq_len // self.window_size - 1) * overlap_ratio + 1)
+                    ]
+                    ws_starts.append(seq_len - self.window_size)
+
+                    for ws in ws_starts:
+                        locations = frames[ws:ws + self.window_size]
+                        gt = []
+                        for idx in range(len(annotations)):
+                            anno = annotations[idx]
+                            label = labels[idx]
+                            
+                            # if the annotation is in the window, we add it to the gt
+                            if anno[0] >= locations[0] and anno[1] <= locations[-1]:
+                                gt.append((anno, label))
+                        
+                        if self.split == 'testing':
+                            self.video_list.append(
+                                VideoRecord(vid, num_frames, locations, gt, fps, self.window_size, self.interval))
+                        
+                        # if the split is training, we only add the video with gt
+                        elif len(gt) > 0:
+                            self.video_list.append(
+                                VideoRecord(vid, num_frames, locations, gt, fps, self.window_size, self.interval))
+
+    def get_data(self, video: VideoRecord):
+        vid = video.id
+        num_frames = video.num_frames
+        base = video.base
+
+        block_idx = list(
+            range(int(video.locations[0]), int(video.locations[-1])))
+
+        if self.img_tensor:
+            video_frames = torch.load(
+                f'{self.tensor_folder}/{self.split}/{vid}')
+            img_sliced = [video_frames[i-1, ...] for i in block_idx]
+            img_sliced = torch.stack(img_sliced, dim=0)
+            img = img_sliced[-1, ...]
+            img_stacked = img_sliced.new_zeros(
+                self.window_size*self.interval, img_sliced.shape[1], img_sliced.shape[2], img_sliced.shape[3])
+            img_stacked[:len(img_sliced), ...] = img_sliced[...]
+            for i in range(self.window_size*self.interval - len(img_sliced)):
+                img_stacked[i+len(img_sliced), ...] = img[...]
+            img_stacked = img_stacked.detach().cpu().numpy()
         else:
-            database = anno_dict['database']
-            all_gts = []
-            for vid in database:
-                all_gts += database[vid]['annotations']
-            classes = list(sorted({x['label'] for x in all_gts}))
-        return classes
+            img_stacked = []
+            path_stacked = [os.path.join(
+                f'{self.frame_folder}/{self.split}', vid, 'img_{:05d}.jpg'.format(i)) for i in block_idx]
+            for i in range(len(path_stacked)):
+                path = path_stacked[i]
+                img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                img_stacked.append(img)
+            img = img_stacked[-1]
+            
+            # if the length of the video is less than the window size, we pad the image with the last frame
+            for i in range(self.window_size*self.interval - len(path_stacked)):
+                img_stacked.append(img)
+            assert len(img_stacked) == self.window_size*self.interval
+            img_stacked = np.stack(img_stacked, axis=0)
+            
+        # transform the image
+        training_transforms, testing_transforms = transform(self.crop_size, self.resize)
+        if self.split == 'training':
+            input_data = training_transforms(img_stacked)
+        else:
+            input_data = testing_transforms(img_stacked)
+        input_data = torch.from_numpy(input_data).permute(3, 0, 1, 2)
+        input_data = (input_data / 255.0) * 2.0 - 1.0
+        locations = torch.Tensor(
+            [location for location in video.locations_offset])
 
-    def _prepare(self):
-        '''parse annotation file'''
-        anno_dict = json.load(open(self.ann_file))
-        self.classes = self._get_classes(anno_dict)
-      
-        self.video_dict, self.video_list = get_dataset_dict(self.ft_info_file, self.ann_file, self.subset, mode=self.mode, online_slice=self.online_slice, slice_len=self.slice_len, slice_overlap=self.slice_overlap, ignore_empty=self.mode == 'train', return_id_list=True)
+        gt_s_e_frames = [(s, e, l) for ((s, e), l) in video.gt_norm]
+        dense_gt = torch.zeros((self.window_size, self.num_classes)).cpu()
 
-        # video_list = self.video_dict.keys()
-        # self.video_list = list(sorted(video_list))
-     
-        logging.info("{} subset video numbers: {}".format(self.subset,len(self.video_list)))
-        self.anno_dict = anno_dict
+        labels = []
+        segments = []
+        for (start, end, label) in gt_s_e_frames:
+            labels.append(int(label))
+            segments.append((start, end))
+            dense_gt[int(start*self.window_size):int(end*self.window_size)+1, int(label)] = 1
 
-        self.cached_data = {}
+        targets = {
+            'labels': torch.LongTensor(labels),
+            'segments': torch.Tensor(segments),
+            'video_id': torch.Tensor([self.video_dict[vid]]),
+            'dense_gt': dense_gt
+        }
 
-        # if the features of all videos is saved in one hdf5 file (all in one), e.g. TSP features
-        self.all_video_data = {}
-        feature_info = self.feature_info
-        fn_templ = feature_info['fn_templ']
-        src_video_list = {self.video_dict[k]['src_vid_name'] for k in self.video_list}
-        # 
-        if feature_info.get('all_in_one', False):
-            data = h5py.File(feature_info['local_path'][self.subset])
-            for k in src_video_list:
-                self.all_video_data[k] = np.array(data[fn_templ % k]).T
-            if not self.online_slice:
-                self.cached_data = self.all_video_data
+        return vid, locations, input_data, targets, num_frames, base
+
+    def __getitem__(self, idx):
+        return self.get_data(self.video_list[idx])
 
     def __len__(self):
         return len(self.video_list)
 
-    def _get_video_data(self, index):
-        if self.is_image_input:
-            return self._get_img_data(index)
-        else:
-            return self._get_feature_data(index)
+class THUMOS14(torch.utils.data.Dataset):
+    def __init__(self, anno_file, frame_file, frame_folder, split, window_size, interval, num_classes, img_tensor=None, tensor_folder=None, crop_size=224, resize=256):
+        self.window_size = window_size
+        self.interval = interval
+        self.anno_file = load_json(anno_file)
+        self.tensor_folder = tensor_folder
+        self.img_tensor = img_tensor
+        self.crop_size = crop_size
+        self.resize = resize
 
-    def _get_feature_data(self,index):
-        video_name = self.video_list[index]
-        # directly fetch from memory
-        if video_name in self.cached_data:
-            video_data = self.cached_data[video_name]
-            return torch.Tensor(video_data).float().contiguous()
+        video_list = self.anno_file.keys()
+        self.num_classes = num_classes
+        self.split = split
+        video_seq = list(video_list)
+        video_seq.sort()
+        self.video_dict = {video_seq[i]: i for i in range(len(video_seq))}
+        self.frame_folder = frame_folder
+        overlap_dict = {'training': 4, 'testing': 1}
 
-        src_vid_name = self.video_dict[video_name]['src_vid_name']
-        # retrieve feature info
-        feature_info = self.feature_info
-        # "ft" is short for "feature"
-        local_ft_dir = feature_info['local_path']
-        ft_format = feature_info['format']
-        local_ft_path = osp.join(local_ft_dir, feature_info['fn_templ'] % src_vid_name) if local_ft_dir else None
-        # the shape of feature sequence, can be TxC (in most cases) or CxT
-        shape = feature_info.get('shape', 'TC')
+        self.video_list = []
+        self.video_frame_pool = {}
+        for vid in video_list:
+            if self.anno_file[vid]['subset'] == self.split:
+                num_frames = int(self.frame_file[vid])
+                fps = num_frames / self.anno_file[vid]['duration']
 
-        if src_vid_name in self.all_video_data:
-            feature_data = self.all_video_data[src_vid_name].T
-        
-        else:
-            feature_data = load_feature(local_ft_path, ft_format, shape)
+                # get annotations
+                annotations = [
+                    [int(fps*item[1]), int(fps*item[2])]
+                    for item in self.anno_file[vid]['actions']
+                ]
 
-        feature_data = feature_data.T   # T x C to C x T.
+                # get labels
+                labels = [
+                    int(item[0])-1
+                    for item in self.anno_file[vid]['actions']
+                ]
 
-        if self.online_slice:
-            slice_start, slice_end = [int(x) for x in video_name.split('_')[-2:]]
-            assert slice_end  > slice_start
-            assert slice_start < feature_data.shape[1]
-            feature_data = feature_data[:, slice_start:slice_end]
+                # every 4 frames extract one feature
+                frames = np.array(
+                    range(1, num_frames-self.interval, self.interval)).reshape(-1, 1)
 
-            if self.padding and feature_data.shape[1] < self.slice_len:
-                diff = self.slice_len - feature_data.shape[1]
-                feature_data = np.pad(
-                    feature_data, ((0, 0), (0, diff)), mode='constant')
+                seq_len = len(frames)
 
-                # IMPORATANT: if padded is done, the length info must be modified
-                self.video_dict[video_name]['feature_length'] = self.slice_len
-                self.video_dict[video_name]['feature_second'] = self.slice_len / self.video_dict[video_name]['feature_fps']
+                # if the seq_len is less than window_size, we pad the location with the last frame
+                if seq_len <= self.window_size:
+                    locations = np.zeros((self.window_size, 1))
+                    locations[:seq_len, :] = frames
+                    locations[seq_len:, :] = frames[-1]
+                    gt = [(annotations[idx], labels[idx])
+                          for idx in range(len(annotations))]
+                    if self.split == 'training' and len(gt) == 0:
+                        print(vid)
+                    self.video_list.append(
+                        VideoRecord(vid, num_frames, locations, gt, fps, self.window_size, self.interval))
 
-        if self.mem_cache and video_name not in self.cached_data:
-            self.cached_data[video_name] = feature_data
-
-        feature_data = torch.Tensor(feature_data).float().contiguous()
-        return feature_data
-
-    def _get_img_data(self, index):
-        video_name = self.video_list[index]
-        src_vid_name = self.video_dict[video_name]['src_vid_name']
-
-        feature_info = self.feature_info
-
-        frame_dir = osp.join(feature_info['local_path'], feature_info['fn_templ'] % src_vid_name)
-
-        if self.online_slice:
-            # for THUMOS14
-            slice_start, slice_end = [int(x) for x in video_name.split('_')[-2:]]
-            start_idx = slice_start
-
-            # clip_length = end_frame_index - start_frame_index + 1. It counts skipped frames when img_stride > 1
-            dst_clip_length = self.slice_len
-            # clip_length: the argument passed to the img loader
-            clip_length = slice_end - slice_start
-            
-            imgs = load_video_frames(frame_dir, start_idx + 1, clip_length, self.img_stride)
-            assert len(imgs) != 0
-
-            # the actual number of frames
-            dst_sample_frames = dst_clip_length // self.img_stride
-
-            if len(imgs) < dst_sample_frames:
-                # try:
-                imgs = np.pad(imgs, ((0, dst_sample_frames - len(imgs)), (0, 0), (0, 0), (0, 0)), mode='constant', constant_values=128)
-                # except:
-                #     pdb.set_trace()
-                self.video_dict[video_name]['feature_length'] = self.slice_len
-                self.video_dict[video_name]['feature_second'] = self.slice_len / self.video_dict[video_name]['feature_fps']
-        else:
-            start_idx = 0
-            video_length = self.video_dict[video_name]['feature_length']
-            dst_clip_length = feature_info.get('num_frames', None)
-            clip_length = min(video_length, dst_clip_length) if dst_clip_length is not None else video_length
-
-            imgs = load_video_frames(frame_dir, start_idx + 1, clip_length, self.img_stride)
-
-            # On ActivityNet/HACS, we use ffmpeg to decode a video into fixed number of frames. 
-            # However, the actual number of decoded frames may differ from the desired number.
-        
-            if dst_clip_length:
-                dst_sample_frames = dst_clip_length // self.img_stride
-
-                if len(imgs) < dst_sample_frames:
-                    imgs = np.pad(imgs, ((0, dst_sample_frames - len(imgs)), (0, 0), (0, 0), (0, 0)), mode='constant', constant_values=128)
-                    
+                # If the number of frames in the video is greater than or equal to the window size, 
+                # we divides the frames into overlapping windows, where the overlap is defined 
+                # as overlap_ratio
                 else:
-                    imgs = imgs[:dst_sample_frames, ...]
-        try:
-            imgs = self.transforms(imgs)
-        except Exception as e:
-            # traceback.print_exc()
-            raise IOError("failed to transform {} from {}".format(video_name, frame_dir))
+                    overlap_ratio = overlap_dict[self.split]
 
-        imgs = torch.from_numpy(np.ascontiguousarray(imgs.transpose([3,0,1,2]))).float()   # thwc -> cthw
-        return imgs
+                    # get the stride of each window
+                    stride = self.window_size // overlap_ratio
 
-    def _get_train_label(self, video_name):
-        '''get normalized target'''
-        video_info = self.video_dict[video_name]
-        video_labels = video_info['annotations']
-        feature_second = video_info['feature_second']
-      
-        target = {
-            'segments': [], 'labels': [],
-            'orig_labels': [], 'video_id': video_name,
-            'video_duration': feature_second,   # only used in inference
-            'feature_fps': video_info['feature_fps'],
-            }
-        for j in range(len(video_labels)):
-            tmp_info=video_labels[j]
-           
-            segment = tmp_info['segment'] 
-            # special rule for thumos14, treat ambiguous instances as negatives
-            if tmp_info['label'] not in self.classes:
-                continue
-            # the label id of first forground class is 0
-            label_id = self.classes.index(tmp_info['label'])
-            target['orig_labels'].append(label_id)
+                    # get the start location of each window
+                    ws_starts = [
+                        i * stride
+                        for i in range((seq_len // self.window_size - 1) * overlap_ratio + 1)
+                    ]
+                    ws_starts.append(seq_len - self.window_size)
 
-            if self.binary:
-                label_id = 0
-            target['segments'].append(segment)
-            target['labels'].append(label_id)
+                    for ws in ws_starts:
+                        locations = frames[ws:ws + self.window_size]
+                        gt = []
+                        for idx in range(len(annotations)):
+                            anno = annotations[idx]
+                            label = labels[idx]
+                            
+                            # if the annotation is in the window, we add it to the gt
+                            if anno[0] >= locations[0] and anno[1] <= locations[-1]:
+                                gt.append((anno, label))
+                        
+                        if self.split == 'testing':
+                            self.video_list.append(
+                                VideoRecord(vid, num_frames, locations, gt, fps, self.window_size, self.interval))
+                        
+                        # if the split is training, we only add the video with gt
+                        elif len(gt) > 0:
+                            self.video_list.append(
+                                VideoRecord(vid, num_frames, locations, gt, fps, self.window_size, self.interval))
 
-        # normalized the coordinate
-        target['segments'] = np.array(target['segments']) / feature_second
-        
-        if len(target['segments']) > 0:
-            target['segments'] = segment_t1t2_to_cw(target['segments'])
+    def get_data(self, video: VideoRecord):
+        vid = video.id
+        num_frames = video.num_frames
+        base = video.base
 
-            # convert to torch format
-            for k, dtype in zip(['segments', 'labels'], ['float32', 'int64']):
-                if not isinstance(target[k], torch.Tensor):
-                    target[k] = torch.from_numpy(np.array(target[k], dtype=dtype))
-       
-        return target
+        block_idx = list(
+            range(int(video.locations[0]), int(video.locations[-1])))
 
-    def __getitem__(self, index):
-        # index = index % len(self.video_list)
-        video_data = self._get_video_data(index)
-        video_name = self.video_list[index]
+        if self.img_tensor:
+            video_frames = torch.load(
+                f'{self.tensor_folder}/{self.split}/{vid}')
+            img_sliced = [video_frames[i-1, ...] for i in block_idx]
+            img_sliced = torch.stack(img_sliced, dim=0)
+            img = img_sliced[-1, ...]
+            img_stacked = img_sliced.new_zeros(
+                self.window_size*self.interval, img_sliced.shape[1], img_sliced.shape[2], img_sliced.shape[3])
+            img_stacked[:len(img_sliced), ...] = img_sliced[...]
+            for i in range(self.window_size*self.interval - len(img_sliced)):
+                img_stacked[i+len(img_sliced), ...] = img[...]
+            img_stacked = img_stacked.detach().cpu().numpy()
+        else:
+            img_stacked = []
+            path_stacked = [os.path.join(
+                f'{self.frame_folder}/{self.split}', vid, 'img_{:05d}.jpg'.format(i)) for i in block_idx]
+            for i in range(len(path_stacked)):
+                path = path_stacked[i]
+                img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                img_stacked.append(img)
+            img = img_stacked[-1]
+            
+            # if the length of the video is less than the window size, we pad the image with the last frame
+            for i in range(self.window_size*self.interval - len(path_stacked)):
+                img_stacked.append(img)
+            assert len(img_stacked) == self.window_size*self.interval
+            img_stacked = np.stack(img_stacked, axis=0)
 
-        target =  self._get_train_label(video_name)
-        
-        return video_data, target
-       
+        training_transforms, testing_transforms = transform(self.crop_size, self.resize)
+        if self.split == 'training':
+            input_data = training_transforms(img_stacked)
+        else:
+            input_data = testing_transforms(img_stacked)
+        input_data = torch.from_numpy(input_data).permute(3, 0, 1, 2)
+        input_data = (input_data / 255.0) * 2.0 - 1.0
+        locations = torch.Tensor(
+            [location for location in video.locations_offset])
 
-def build(dataset, subset, args, mode):
-    '''build TADDataset'''
-    subset_mapping, feature_info, ann_file, ft_info_file = get_dataset_info(dataset, args.feature)
-    transforms = None
-    if args.input_type == 'image':
-        if args.encoder == 'i3d':
-            mean, std = (127.5, 127.5)
-        elif args.encoder == 'slowfast' or args.backbone.startswith('ts'):
-            mean, std = ([123.675, 116.28, 103.53], [58.395, 57.12, 57.375])
-        transforms = make_img_transform(
-            mode=='train', mean=mean, std=std, resize=args.img_resize, crop=args.img_crop_size, keep_asr=args.resize_keep_asr)
-    else:
-        transforms = None
-    return TADDataset(
-        subset_mapping[subset], mode, feature_info, ann_file, ft_info_file, transforms,
-        online_slice=args.online_slice, slice_len=args.slice_len, slice_overlap=args.slice_overlap if mode=='train' else args.test_slice_overlap, 
-        binary=args.binary,
-        input_type=args.input_type)
+        gt_s_e_frames = [(s, e, l) for ((s, e), l) in video.gt_norm]
+        dense_gt = torch.zeros((self.window_size, self.num_classes)).cpu()
+
+        labels = []
+        segments = []
+        for (start, end, label) in gt_s_e_frames:
+            labels.append(int(label))
+            segments.append((start, end))
+
+        targets = {
+            'labels': torch.LongTensor(labels),
+            'segments': torch.Tensor(segments),
+            'video_id': torch.Tensor([self.video_dict[vid]]),
+        }
+
+        return vid, locations, input_data, targets, num_frames, base
+
+    def __getitem__(self, idx):
+        return self.get_data(self.video_list[idx])
+
+    def __len__(self):
+        return len(self.video_list)
+
+
+class Charades(torch.utils.data.Dataset):
+    def __init__(self, anno_file, frame_folder, split, window_size, interval, num_classes, img_tensor=None, tensor_folder=None, crop_size=224, resize=256):
+        self.window_size = window_size
+        self.interval = interval
+        self.num_classes = num_classes
+        self.split = split
+        self.frame_folder = frame_folder
+        self.tensor_folder = tensor_folder
+        self.img_tensor = img_tensor
+        self.crop_size = crop_size
+        self.resize = resize
+
+        self.anno_file = load_json(anno_file)
+        video_list = self.anno_file.keys()
+        video_seq = list(video_list)
+        video_seq.sort()
+        self.video_dict = {video_seq[i]: i for i in range(len(video_seq))}
+
+        overlap_dict = {'training': 3, 'testing': 1}
+
+        self.video_list = []
+        self.frame_pool = {}
+        for vid in video_list:
+            if self.split == self.anno_file[vid]['subset']:
+                fps = 12
+                num_frames = int(self.anno_file[vid]['duration']*fps)
+                action_list = list(
+                    filter(lambda x: (x[1] <= x[2]), self.anno_file[vid]['actions']))
+                annotations = [
+                    [int(item[1]*fps), min(int(item[2]*fps), num_frames)]
+                    for item in action_list
+                ]
+                labels = [
+                    int(item[0])
+                    for item in action_list
+                ]
+                frames = np.array(
+                    range(0, num_frames-self.interval, self.interval)).reshape(-1, 1)
+                seq_len = len(frames)
+                if seq_len <= self.window_size:
+                    locations = np.zeros((self.window_size, 1))
+                    locations[:seq_len, :] = frames
+                    locations[seq_len:, :] = frames[-1]
+                    gt = [(annotations[idx], labels[idx])
+                          for idx in range(len(annotations))]
+                    self.video_list.append(
+                        VideoRecord(vid, num_frames,
+                                    locations, gt, fps, self.window_size, self.interval))
+
+                else:
+                    overlap_ratio = overlap_dict[self.split]
+                    stride = self.window_size // overlap_ratio
+                    ws_starts = [
+                        i * stride
+                        for i in range((seq_len // self.window_size - 1) * overlap_ratio + 1)]
+                    ws_starts.append(seq_len - self.window_size)
+
+                    for ws in ws_starts:
+                        locations = frames[ws:ws + self.window_size]
+                        gt = []
+                        for idx in range(len(annotations)):
+                            anno = annotations[idx]
+                            label = labels[idx]
+                            if anno[0] >= locations[0] and anno[1] <= locations[-1]:
+                                gt.append((anno, label))
+
+                        if self.split == 'testing':
+                            self.video_list.append(
+                                VideoRecord(vid, num_frames,
+                                            locations, gt, fps, self.window_size, self.interval))
+                        elif len(gt) > 0:
+                            self.video_list.append(
+                                VideoRecord(vid, num_frames,
+                                            locations, gt, fps, self.window_size, self.interval))
+
+    def get_data(self, video: VideoRecord):
+        vid = video.id
+        num_frames = video.num_frames
+        base = video.base
+
+        block_idx = list(
+            range(int(video.locations[0]), int(video.locations[-1])))
+
+        if self.img_tensor:
+            video_frames = torch.load(f'{self.tensor_folder}/{vid}')
+            img_sliced = [video_frames[i*2-1, ...] for i in block_idx]
+            img_sliced = torch.stack(img_sliced, dim=0)
+            img = img_sliced[-1, ...]
+            img_stacked = img_sliced.new_zeros(
+                self.window_size*self.interval, img_sliced.shape[1], img_sliced.shape[2], img_sliced.shape[3])
+            img_stacked[:len(img_sliced), ...] = img_sliced[...]
+            for i in range(self.window_size*self.interval - len(img_sliced)):
+                img_stacked[i+len(img_sliced), ...] = img[...]
+            img_stacked = img_stacked.detach().cpu().numpy()
+        else:
+            img_stacked = []
+            path_stacked = [os.path.join(
+                self.frame_folder, vid, '{}-{:06d}.jpg'.format(vid, i*2+1)) for i in block_idx]
+            for i in range(len(path_stacked)):
+                path = path_stacked[i]
+                img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                assert img is not None, '{} {}'.format(i, path)
+                img_stacked.append(img)
+            img = img_stacked[-1]
+            for i in range(self.window_size*self.interval - len(path_stacked)):
+                img_stacked.append(img)
+            assert len(img_stacked) == self.window_size*self.interval
+
+            img_stacked = np.stack(img_stacked, axis=0)
+
+        training_transforms, testing_transforms = transform(self.crop_size, self.resize)
+        if self.split == 'training':
+            input_data = training_transforms(img_stacked)
+        else:
+            input_data = testing_transforms(img_stacked)
+
+        input_data = torch.from_numpy(input_data).permute(3, 0, 1, 2)
+        input_data = (input_data / 255.0) * 2.0 - 1.0
+
+        locations = torch.Tensor(
+            [location for location in video.locations_offset])
+
+        gt_s_e_frames = [(s, e, l) for ((s, e), l) in video.gt_norm]
+        dense_gt = torch.zeros((self.window_size, self.num_classes))
+
+        labels = []
+        segments = []
+        for (start, end, label) in gt_s_e_frames:
+            labels.append(int(label))
+            segments.append((start, end))
+            dense_gt[int(start*self.window_size):int(end*self.window_size)+1, int(label)] = 1
+
+        targets = {
+            'labels': np.array(labels),
+            'segments': np.array(segments),
+            'video_id': np.array([self.video_dict[vid]]),
+            'dense_gt': dense_gt
+        }
+
+        return vid, locations, input_data, targets, num_frames, base
+
+    def __getitem__(self, idx):
+        return self.get_data(self.video_list[idx])
+
+    def __len__(self):
+        return len(self.video_list)
+
+
+def collate_fn(batch):
+    vid_name_list, target_list, num_frames_list, base_list = [
+        [] for _ in range(4)]
+    batch_size = len(batch)
+    max_props_num = batch[0][1].shape[0]
+    raw_frames = []
+    locations = torch.zeros(batch_size, max_props_num, 1, dtype=torch.double)
+
+    for i, sample in enumerate(batch):
+        vid_name_list.append(sample[0])
+        target_list.append(sample[3])
+        raw_frames.append(sample[2])
+        locations[i, :max_props_num, :] = sample[1].reshape((-1, 1))
+        num_frames_list.append(sample[4])
+        base_list.append(sample[5])
+
+    raw_frames = torch.stack(raw_frames, dim=0)
+    num_frames_list = torch.from_numpy(np.array(num_frames_list))
+    base_list = torch.from_numpy(np.array(base_list))
+
+    return vid_name_list, locations, raw_frames, target_list, num_frames_list, base_list
+
+
+def build_multithumos(args):
+    return MultiTHUMOS(args.annotation_path, args.frame_file_path, args.frame_folder, args.split, args.window_size, args.interval, args.num_classes, args.img_tensor, args.tensor_folder, crop_size=args.crop_size, resize=args.resize)
+
+def build_thumos14(args):
+    return THUMOS14(args.annotation_path, args.frame_file_path, args.frame_folder, args.split, args.window_size, args.interval, args.num_classes, args.img_tensor, args.tensor_folder, crop_size=args.crop_size, resize=args.resize)
+
+def build_charades(args):
+    return Charades(args.annotation_path, args.frame_folder, args.split, args.window_size, args.interval, args.num_classes, args.img_tensor, args.tensor_folder, crop_size=args.crop_size, resize=args.resize)
+
+# def build_activitynet(split, args):
+#     return ActivityNet(args.annotation_path, args.frame_folder, split, args.window_size, args.interval, args.num_classes, args.img_tensor, args.tensor_folder)

@@ -13,6 +13,7 @@ import torchvision
 from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
 from einops import rearrange
+from datasets.misc import NestedTensor
 
 from backbones import TSM
 from backbones import ResNet3dSlowFast
@@ -41,6 +42,10 @@ class VideoEncoder(nn.Module):
         super().__init__()
         self.arch = arch
         self.use_upsample = cfg.temporal_upsample
+        self.spatial_pool = cfg.spatial_pool
+        self.snippet_wise_feature = cfg.snippet_wise_feature
+        self.snippet_length = cfg.snippet_length
+        self.snippet_stride = cfg.snippet_stride
         
         if arch == 'slowfast':
             self.backbone = ResNet3dSlowFast(None, depth=cfg.slowfast_depth,freeze_bn=cfg.freeze_bn, freeze_bn_affine=cfg.freeze_affine, slow_upsample=cfg.slow_upsample)
@@ -55,8 +60,6 @@ class VideoEncoder(nn.Module):
 
         else:
             raise ValueError('Not supported arch: {}'.format(arch))
-        
-        
 
     def forward(self, tensor_list):
         '''tensor_list: tensors+mask'''
@@ -70,11 +73,11 @@ class VideoEncoder(nn.Module):
         shape = tensors.shape
         # it takes as input image sequence or feature vector sequence
         if len(shape) == 5:   # (n,c,t,h,w)
-            pooler = F.adaptive_max_pool3d if cfg.spatial_pool == 'max' else F.adaptive_avg_pool3d
+            pooler = F.adaptive_max_pool3d if self.spatial_pool == 'max' else F.adaptive_avg_pool3d
            
             ip = tensor_list.tensors
-            if cfg.snippet_wise_feature:
-                ip = unfold(tensor_list.tensors, cfg.snippet_length, cfg.snippet_stride)
+            if self.snippet_wise_feature:
+                ip = unfold(tensor_list.tensors, self.snippet_length, self.snippet_stride)
                 video_ft = self.backbone(ip).mean(2)       # (n*n_window, c, t, h, w)
                 T = video_ft.shape[0] // batch_size
                 video_ft_fold = video_ft.reshape(batch_size, T, *(video_ft.shape[1:]))  # (n, n_window, c, h, w)
@@ -90,7 +93,7 @@ class VideoEncoder(nn.Module):
                 if video_ft.ndim == 5:
                     video_ft = pooler(video_ft, [None, 1, 1])[..., 0, 0]  # [n, c, t]
                 if self.use_upsample:
-                    video_ft = F.interpolate(video_ft, scale_factor=cfg.temporal_upscale, mode='linear')
+                    video_ft = F.interpolate(video_ft, scale_factor=self.temporal_upscale, mode='linear')
                 mask = F.interpolate(mask[None].float(), size=video_ft.shape[2], mode='nearest').to(torch.bool)[0]  # [n, t]
                 out = NestedTensor(video_ft, mask)
             else:
@@ -102,20 +105,8 @@ class VideoEncoder(nn.Module):
             out = NestedTensor(video_ft, mask)
         
         return out
-        
-
-class EmptyEncoder(nn.Module):
-    def __init__(self, feature_dim):
-        super().__init__()
-        self.num_channels = feature_dim
-
-    def forward(self, x):
-        return x
 
 
 def build_video_encoder(args):
-    if args.input_type == 'feature':
-        model = EmptyEncoder(args.feature_dim)
-    else:
-        model = VideoEncoder(args.encoder, args.fix_encoder)
+    model = VideoEncoder(args.encoder_arch, args)
     return model
