@@ -1,41 +1,38 @@
-# I3D models trained on Kinetics
+# Video_Feature_Extractor
 
 ## Overview
 
-This repository contains trained models reported in the paper "[Quo Vadis,
-Action Recognition? A New Model and the Kinetics
-Dataset](https://arxiv.org/abs/1705.07750)" by Joao Carreira and Andrew
-Zisserman.
-
-Tensorflow code is from Deepmind's [Kinetics-I3D](https://github.com/deepmind/kinetics-i3d).
-
-Pytorch code is from [Kinetics-I3D](https://github.com/piergiaj/pytorch-i3d)
-
-## Fine-tuning and Feature Extraction
-These models were pretrained on imagenet and kinetics (see original repo) for details).
-
-## Something to say
-You need to down load the checkpoint from the original repo
-1. default load the kinetics pre-trained model
-2. extract features in thumos14 validation and test dataset
-the extract way is segment the video at uniform interval.
-
-frames      | interval        | video fps
------------ | :-------------: | -----------
-<=15000     | 24              | 30
-<=30000     | 48              | 30
-\>30000     | 96              | 30
-
-In order to reduce the redundancy in frames, we choose to subsample the video to 10fps.
-A clip includes 48 frames, we sample 16 frames and send to the I3D network to extract [1,1024] features
-
-Feature is generated after Mix_5c and avg_pool layer:
-
-input -> output:
-
-rgb: [1, 16, 224, 224, 3] -> [1024,]
-
-flow:[1, 16, 224, 224, 2] -> [1024,]
+This repository contains the code for extracting features from videos using I3D, slowfast and other supported backbones.
 
 
-# Video_Feature_Extractor
+## Data Preparation
+
+### Thumos14
+
+You can download the raw videos from [here](https://www.crcv.ucf.edu/data/THUMOS14/). The evaluation set is used for training, and the test set is used for testing. The annotations are available [here](https://www.crcv.ucf.edu/data/THUMOS14/).
+
+You can use the given annotation files by me to extract the features, for which I removed some wrong annotations (history problem). You can see them in the datasets folder.
+
+### ActivityNet
+
+You can download the raw videos from [here](http://activity-net.org/download.html). Not supported yet.
+
+
+### MultiThumos
+
+This dataset is an extension of the original Thumos14 dataset. We have prepared the annotations for you
+
+
+### Charades
+
+This dataset is a large scale dataset for action recognition. You can download the raw videos from [here](https://allenai.org/plato/charades/). We use the GRB frames for feature extractions.
+
+### Other datasets
+
+If you want to use other datasets, you can prepare the annotations in the same format as the given ones. Then, you can write your own dataset class in the datasets folder.
+
+## Extraction
+
+We use 10 fps, every 4 frames for a feature for THUMOS14. You can change it in the config file.
+Note that we use windows for feature extraction. The default window size is 64 for thumos14. You can change it in the config file.
+
