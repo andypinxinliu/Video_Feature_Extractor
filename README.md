@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository contains the code for extracting features from videos using I3D, slowfast and other supported backbones.
+Inspried by the previous works. I found it took a long time to look for resources of extracting features from videos. Thus, based on [torch-i3d](https://github.com/demianzhang/thumos14-i3d/blob/master/kinetics-i3d-pytorch/extract_features.py), I extend the feature extraction to support multiple datasets and backbones. This will help ease the works for the future research purposes. This repository contains the code for extracting features from videos using I3D, slowfast and other supported backbones.
 
 
 ## Data Preparation
