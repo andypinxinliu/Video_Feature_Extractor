@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.utils.data
+from .misc import NestedTensor
 import h5py as h5
 from tqdm import tqdm
 import cv2
@@ -35,8 +36,8 @@ def transform(crop_size, resize):
     ])
 
     testing_transforms = transforms.Compose([
-        GroupResizeShorterSide(IMAGE_RESIZE_SIZE),
-        GroupCenterCrop(IMAGE_CROP_SIZE),
+        GroupResizeShorterSide(resize),
+        GroupCenterCrop(crop_size),
     ])
     return training_transforms, testing_transforms
 
@@ -186,8 +187,9 @@ class MultiTHUMOS(torch.utils.data.Dataset):
             img_stacked = img_sliced.new_zeros(
                 self.window_size*self.interval, img_sliced.shape[1], img_sliced.shape[2], img_sliced.shape[3])
             img_stacked[:len(img_sliced), ...] = img_sliced[...]
-            for i in range(self.window_size*self.interval - len(img_sliced)):
-                img_stacked[i+len(img_sliced), ...] = img[...]
+            img_stacked[len(img_sliced):, ...].copy_(img[...])
+            mask = torch.zeros(self.window_size*self.interval, dtype=torch.bool)
+            mask[len(img_sliced):] = True
             img_stacked = img_stacked.detach().cpu().numpy()
         else:
             img_stacked = []
@@ -205,19 +207,25 @@ class MultiTHUMOS(torch.utils.data.Dataset):
             assert len(img_stacked) == self.window_size*self.interval
             img_stacked = np.stack(img_stacked, axis=0)
             
+            mask = torch.zeros(self.window_size*self.interval, dtype=torch.bool)
+            mask[len(path_stacked):] = True
+            
         # transform the image
         training_transforms, testing_transforms = transform(self.crop_size, self.resize)
         if self.split == 'training':
             input_data = training_transforms(img_stacked)
         else:
             input_data = testing_transforms(img_stacked)
-        input_data = torch.from_numpy(input_data).permute(3, 0, 1, 2)
+        
+        # make the tensor to be contiguous
+        input_data = torch.from_numpy(np.ascontiguousarray(input_data.transpose([3,0,1,2]))).float()
         input_data = (input_data / 255.0) * 2.0 - 1.0
-        locations = torch.Tensor(
-            [location for location in video.locations_offset])
+        
+        # locations = torch.Tensor(
+        #     [location for location in video.locations_offset])
 
         gt_s_e_frames = [(s, e, l) for ((s, e), l) in video.gt_norm]
-        dense_gt = torch.zeros((self.window_size, self.num_classes)).cpu()
+        dense_gt = np.zeros((self.window_size, self.num_classes))
 
         labels = []
         segments = []
@@ -227,13 +235,13 @@ class MultiTHUMOS(torch.utils.data.Dataset):
             dense_gt[int(start*self.window_size):int(end*self.window_size)+1, int(label)] = 1
 
         targets = {
-            'labels': torch.LongTensor(labels),
-            'segments': torch.Tensor(segments),
-            'video_id': torch.Tensor([self.video_dict[vid]]),
+            'labels': np.array(labels),
+            'segments': np.array(segments),
+            'video_id': self.video_dict[vid],
             'dense_gt': dense_gt
         }
 
-        return vid, locations, input_data, targets, num_frames, base
+        return vid, input_data, mask, targets, num_frames, base
 
     def __getitem__(self, idx):
         return self.get_data(self.video_list[idx])
@@ -245,11 +253,12 @@ class THUMOS14(torch.utils.data.Dataset):
     def __init__(self, anno_file, frame_file, frame_folder, split, window_size, interval, num_classes, img_tensor=None, tensor_folder=None, crop_size=224, resize=256):
         self.window_size = window_size
         self.interval = interval
-        self.anno_file = load_json(anno_file)
-        self.tensor_folder = tensor_folder
-        self.img_tensor = img_tensor
         self.crop_size = crop_size
         self.resize = resize
+        self.anno_file = load_json(anno_file)
+        self.frame_file = load_json(frame_file)
+        self.tensor_folder = tensor_folder
+        self.img_tensor = img_tensor
 
         video_list = self.anno_file.keys()
         self.num_classes = num_classes
@@ -350,8 +359,9 @@ class THUMOS14(torch.utils.data.Dataset):
             img_stacked = img_sliced.new_zeros(
                 self.window_size*self.interval, img_sliced.shape[1], img_sliced.shape[2], img_sliced.shape[3])
             img_stacked[:len(img_sliced), ...] = img_sliced[...]
-            for i in range(self.window_size*self.interval - len(img_sliced)):
-                img_stacked[i+len(img_sliced), ...] = img[...]
+            img_stacked[len(img_sliced):, ...].copy_(img[...])
+            mask = torch.zeros(self.window_size*self.interval, dtype=torch.bool)
+            mask[len(img_sliced):] = True
             img_stacked = img_stacked.detach().cpu().numpy()
         else:
             img_stacked = []
@@ -368,34 +378,43 @@ class THUMOS14(torch.utils.data.Dataset):
                 img_stacked.append(img)
             assert len(img_stacked) == self.window_size*self.interval
             img_stacked = np.stack(img_stacked, axis=0)
-
+            
+            mask = torch.zeros(self.window_size*self.interval, dtype=torch.bool)
+            mask[len(path_stacked):] = True
+            
+        # transform the image
         training_transforms, testing_transforms = transform(self.crop_size, self.resize)
         if self.split == 'training':
             input_data = training_transforms(img_stacked)
         else:
             input_data = testing_transforms(img_stacked)
-        input_data = torch.from_numpy(input_data).permute(3, 0, 1, 2)
+        
+        # make the tensor to be contiguous
+        input_data = torch.from_numpy(np.ascontiguousarray(input_data.transpose([3,0,1,2]))).float()
         input_data = (input_data / 255.0) * 2.0 - 1.0
-        locations = torch.Tensor(
-            [location for location in video.locations_offset])
+        
+        # locations = torch.Tensor(
+        #     [location for location in video.locations_offset])
 
         gt_s_e_frames = [(s, e, l) for ((s, e), l) in video.gt_norm]
-        dense_gt = torch.zeros((self.window_size, self.num_classes)).cpu()
+        dense_gt = np.zeros((self.window_size, self.num_classes))
 
         labels = []
         segments = []
         for (start, end, label) in gt_s_e_frames:
             labels.append(int(label))
             segments.append((start, end))
+            dense_gt[int(start*self.window_size):int(end*self.window_size)+1, int(label)] = 1
 
         targets = {
-            'labels': torch.LongTensor(labels),
-            'segments': torch.Tensor(segments),
-            'video_id': torch.Tensor([self.video_dict[vid]]),
+            'labels': np.array(labels),
+            'segments': np.array(segments),
+            'video_id': self.video_dict[vid],
+            'dense_gt': dense_gt
         }
 
-        return vid, locations, input_data, targets, num_frames, base
-
+        return vid, input_data, mask, targets, num_frames, base
+    
     def __getitem__(self, idx):
         return self.get_data(self.video_list[idx])
 
@@ -487,46 +506,53 @@ class Charades(torch.utils.data.Dataset):
             range(int(video.locations[0]), int(video.locations[-1])))
 
         if self.img_tensor:
-            video_frames = torch.load(f'{self.tensor_folder}/{vid}')
-            img_sliced = [video_frames[i*2-1, ...] for i in block_idx]
+            video_frames = torch.load(
+                f'{self.tensor_folder}/{self.split}/{vid}')
+            img_sliced = [video_frames[i-1, ...] for i in block_idx]
             img_sliced = torch.stack(img_sliced, dim=0)
             img = img_sliced[-1, ...]
             img_stacked = img_sliced.new_zeros(
                 self.window_size*self.interval, img_sliced.shape[1], img_sliced.shape[2], img_sliced.shape[3])
             img_stacked[:len(img_sliced), ...] = img_sliced[...]
-            for i in range(self.window_size*self.interval - len(img_sliced)):
-                img_stacked[i+len(img_sliced), ...] = img[...]
+            img_stacked[len(img_sliced):, ...].copy_(img[...])
+            mask = torch.zeros(self.window_size*self.interval, dtype=torch.bool)
+            mask[len(img_sliced):] = True
             img_stacked = img_stacked.detach().cpu().numpy()
         else:
             img_stacked = []
             path_stacked = [os.path.join(
-                self.frame_folder, vid, '{}-{:06d}.jpg'.format(vid, i*2+1)) for i in block_idx]
+                f'{self.frame_folder}/{self.split}', vid, 'img_{:05d}.jpg'.format(i)) for i in block_idx]
             for i in range(len(path_stacked)):
                 path = path_stacked[i]
                 img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-                assert img is not None, '{} {}'.format(i, path)
                 img_stacked.append(img)
             img = img_stacked[-1]
+            
+            # if the length of the video is less than the window size, we pad the image with the last frame
             for i in range(self.window_size*self.interval - len(path_stacked)):
                 img_stacked.append(img)
             assert len(img_stacked) == self.window_size*self.interval
-
             img_stacked = np.stack(img_stacked, axis=0)
-
+            
+            mask = torch.zeros(self.window_size*self.interval, dtype=torch.bool)
+            mask[len(path_stacked):] = True
+            
+        # transform the image
         training_transforms, testing_transforms = transform(self.crop_size, self.resize)
         if self.split == 'training':
             input_data = training_transforms(img_stacked)
         else:
             input_data = testing_transforms(img_stacked)
-
-        input_data = torch.from_numpy(input_data).permute(3, 0, 1, 2)
+        
+        # make the tensor to be contiguous
+        input_data = torch.from_numpy(np.ascontiguousarray(input_data.transpose([3,0,1,2]))).float()
         input_data = (input_data / 255.0) * 2.0 - 1.0
-
-        locations = torch.Tensor(
-            [location for location in video.locations_offset])
+        
+        # locations = torch.Tensor(
+        #     [location for location in video.locations_offset])
 
         gt_s_e_frames = [(s, e, l) for ((s, e), l) in video.gt_norm]
-        dense_gt = torch.zeros((self.window_size, self.num_classes))
+        dense_gt = np.zeros((self.window_size, self.num_classes))
 
         labels = []
         segments = []
@@ -538,11 +564,11 @@ class Charades(torch.utils.data.Dataset):
         targets = {
             'labels': np.array(labels),
             'segments': np.array(segments),
-            'video_id': np.array([self.video_dict[vid]]),
+            'video_id': self.video_dict[vid],
             'dense_gt': dense_gt
         }
 
-        return vid, locations, input_data, targets, num_frames, base
+        return vid, input_data, mask, targets, num_frames, base
 
     def __getitem__(self, idx):
         return self.get_data(self.video_list[idx])
@@ -552,26 +578,9 @@ class Charades(torch.utils.data.Dataset):
 
 
 def collate_fn(batch):
-    vid_name_list, target_list, num_frames_list, base_list = [
-        [] for _ in range(4)]
-    batch_size = len(batch)
-    max_props_num = batch[0][1].shape[0]
-    raw_frames = []
-    locations = torch.zeros(batch_size, max_props_num, 1, dtype=torch.double)
-
-    for i, sample in enumerate(batch):
-        vid_name_list.append(sample[0])
-        target_list.append(sample[3])
-        raw_frames.append(sample[2])
-        locations[i, :max_props_num, :] = sample[1].reshape((-1, 1))
-        num_frames_list.append(sample[4])
-        base_list.append(sample[5])
-
-    raw_frames = torch.stack(raw_frames, dim=0)
-    num_frames_list = torch.from_numpy(np.array(num_frames_list))
-    base_list = torch.from_numpy(np.array(base_list))
-
-    return vid_name_list, locations, raw_frames, target_list, num_frames_list, base_list
+    vids, input_datas, masks, targets, num_frames, bases = list(zip(*batch))
+    inputs = NestedTensor(torch.stack(input_datas), torch.stack(masks))
+    return vids, inputs, targets, num_frames, bases
 
 
 def build_multithumos(args):

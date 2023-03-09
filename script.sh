@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1,2,3 python -m torch.distributed.launch --nproc_per_node=3 --use_env main.py --img_tensor True

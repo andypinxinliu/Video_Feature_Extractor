@@ -17,7 +17,7 @@ from datasets.misc import NestedTensor
 
 from backbones import TSM
 from backbones import ResNet3dSlowFast
-from backbones import InceptionI3d
+from backbones import I3D_BackBone
 
 
 def unfold(ip, kernel_size, stride):
@@ -56,7 +56,7 @@ class VideoEncoder(nn.Module):
             self.num_channels = self.backbone.out_channels
             
         elif arch == 'i3d':
-            self.backbone = InceptionI3d(400, in_channels=3)
+            self.backbone = I3D_BackBone(window_size=cfg.window_size, freeze_bn=cfg.freeze_bn, freeze_bn_affine=cfg.freeze_affine)
 
         else:
             raise ValueError('Not supported arch: {}'.format(arch))

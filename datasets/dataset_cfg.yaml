@@ -4,17 +4,19 @@ multithumos:
   num_classes: 65
   interval: 4
   frame_folder: data/thumos14
-  tensor_folder: data/multithumos_tensors
+  tensor_folder: data/thumos14_tensors
   annotation_path: datasets/multithumos.json
   frame_file_path: datasets/multithumos_frames.json
-  crop_size: 224
-  resize: 256
+  crop_size: 192
+  resize: 224
 
 # Model parameters
   spatial_pool: avg
   temporal_upscale: false
   temporal_upsample: false
   resize_keep_asr: true
+  freeze_bn: true
+  freeze_affine: true
   # snippet wise feature extraction (not recommended)
   snippet_wise_feature: false
   snippet_length: 8
@@ -33,14 +35,16 @@ charades:
   tensor_folder: data/charades_v1_rgb_tensors
   annotation_path: datasets/charades.json
   frame_file_path: datasets/charades_frames.json
-  crop_size: 224
-  resize: 256
+  crop_size: 192
+  resize: 224
 
-  # Model parameters
+# Model parameters
   spatial_pool: avg
   temporal_upscale: false
   temporal_upsample: false
   resize_keep_asr: true
+  freeze_bn: true
+  freeze_affine: true
   # snippet wise feature extraction (not recommended)
   snippet_wise_feature: false
   snippet_length: 8
@@ -56,17 +60,19 @@ thumos14:
   num_classes: 20
   interval: 4
   frame_folder: data/thumos14
-  tensor_folder: data/multithumos_tensors
+  tensor_folder: data/thumos14_tensors
   annotation_path: datasets/thumos14.json
   frame_file_path: datasets/multithumos_frames.json
-  crop_size: 224
-  resize: 256
+  crop_size: 192
+  resize: 224
 
-  # Model parameters
+# Model parameters
   spatial_pool: avg
   temporal_upscale: false
   temporal_upsample: false
   resize_keep_asr: true
+  freeze_bn: true
+  freeze_affine: true
   # snippet wise feature extraction (not recommended)
   snippet_wise_feature: false
   snippet_length: 8
@@ -85,8 +91,8 @@ activitynet:
   tensor_folder: data/multithumos_tensors
   annotation_path: datasets/multithumos.json
   frame_file_path: datasets/multithumos_frames.json
-  crop_size: 224
-  resize: 256
+  crop_size: 292
+  resize: 224
 
   # Model parameters
   spatial_pool: avg
